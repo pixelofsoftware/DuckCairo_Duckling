@@ -1,0 +1,346 @@
+#{
+    Praktyczne zastosowanie wrappera: generator wykresu słupkowego do raportów.
+
+    Program czyta ze standardowego wejścia trzy wiersze:
+      1. plik CSV z danymi: w każdym wierszu "etykieta;wartość" (wartość >= 0, kropka albo
+         przecinek dziesiętny; wiersze puste i zaczynające się od # są pomijane),
+      2. nazwę plików wynikowych bez rozszerzenia,
+      3. tytuł wykresu (pusty wiersz - nazwa pliku CSV).
+    Ta sama scena (640 x 400) jest rysowana na trzech powierzchniach i zapisywana jako
+    <nazwa>.png (piksele), <nazwa>.svg i <nazwa>.pdf (wektorowo, w punktach). Po zapisie
+    program sprawdza wyniki: wczytuje PNG i porównuje kolor pierwszego słupka, a w SVG i PDF
+    sprawdza początek i koniec pliku.
+    Kod zakończenia: 0 - sukces, 2 - złe dane albo parametry, 3 - błąd odczytu CSV,
+    5 - błąd zapisu albo niezgodność przy sprawdzeniu.
+#}
+import core.containers.*;
+import core.primitive_io as io;
+import cairo;
+import pliki;
+
+const SZEROKOSC: f64 = 640.0;
+const WYSOKOSC: f64 = 400.0;
+const LEWY: f64 = 70.0;
+const PRAWY: f64 = 20.0;
+const GORNY: f64 = 60.0;
+const DOLNY: f64 = 50.0;
+const MAKS_SLUPKOW: i64 = 24;
+
+class Wiersz {
+    tekst: String;
+    jest: bool = false;
+}
+
+class Pozycja {
+    etykieta: String;
+    zapis: String;      # wartość tak, jak w pliku
+    wartosc: f64 = 0.0;
+}
+
+class Dane {
+    ok: bool = false;
+    pozycje: List[Pozycja];
+    blad: String;
+}
+
+fun czytajWiersz() -> Wiersz = {
+    var w: Wiersz;
+    var znak = io.readCharCode();
+    if (znak < 0) return w;
+    w.jest = true;
+    while (znak >= 0 and znak != '\n' as i32) {
+        if (znak != '\r' as i32) w.tekst.append(znak as char);
+        znak = io.readCharCode();
+    }
+    return w;
+}
+
+fun przytnij(s: str) -> String = {
+    var poczatek: i64 = 0;
+    var koniec = s.length();
+    while (poczatek < koniec and (s[poczatek] == ' ' or s[poczatek] == '\t')) {
+        poczatek += 1;
+    }
+    while (koniec > poczatek and (s[koniec - 1] == ' ' or s[koniec - 1] == '\t' or s[koniec - 1] == '\r')) {
+        koniec -= 1;
+    }
+    var w: String;
+    var i = poczatek;
+    while (i < koniec) {
+        w.append(s[i]);
+        i += 1;
+    }
+    return w;
+}
+
+# Liczba nieujemna z kropką albo przecinkiem dziesiętnym; -1 dla niepoprawnego zapisu.
+fun liczba(s: str) -> f64 = {
+    if (s.length() == 0) return -1.0;
+    var wynik: f64 = 0.0;
+    var dzielnik: f64 = 1.0;
+    var poPrzecinku = false;
+    var cyfry: i64 = 0;
+    var i: i64 = 0;
+    while (i < s.length()) {
+        let c = s[i];
+        if (c >= '0' and c <= '9') {
+            let cyfra = ((c as i64) - 48) as f64;
+            if (poPrzecinku) {
+                dzielnik = dzielnik * 10.0;
+                wynik = wynik + cyfra / dzielnik;
+            } else {
+                wynik = wynik * 10.0 + cyfra;
+            }
+            cyfry += 1;
+        } else if ((c == '.' or c == ',') and not poPrzecinku) {
+            poPrzecinku = true;
+        } else {
+            return -1.0;
+        }
+        i += 1;
+    }
+    if (cyfry == 0) return -1.0;
+    return wynik;
+}
+
+fun wczytajDane(sciezka: str) -> Dane = {
+    var d: Dane;
+    let plik = pliki.wczytaj(sciezka);
+    if (not plik.ok) {
+        d.blad.append(plik.blad.asSlice());
+        return d;
+    }
+    let t = plik.tresc.asSlice();
+    var numer: i64 = 0;
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while (i <= t.length()) {
+        if (i == t.length() or t[i] == '\n') {
+            numer += 1;
+            var linia: String;
+            var j = start;
+            while (j < i) {
+                linia.append(t[j]);
+                j += 1;
+            }
+            let czysta = przytnij(linia.asSlice());
+            if (czysta.length() > 0 and czysta.asSlice()[0] != '#') {
+                var srednik: i64 = -1;
+                var m: i64 = 0;
+                while (m < czysta.length()) {
+                    if (czysta.asSlice()[m] == ';' and srednik < 0) srednik = m;
+                    m += 1;
+                }
+                if (srednik < 0) {
+                    d.blad.append(f"wiersz {numer}: brak srednika (oczekiwano 'etykieta;wartosc')");
+                    return d;
+                }
+                var p: Pozycja;
+                var e: String;
+                var z: String;
+                var n: i64 = 0;
+                while (n < czysta.length()) {
+                    if (n < srednik) e.append(czysta.asSlice()[n]);
+                    if (n > srednik) z.append(czysta.asSlice()[n]);
+                    n += 1;
+                }
+                p.etykieta = przytnij(e.asSlice());
+                p.zapis = przytnij(z.asSlice());
+                p.wartosc = liczba(p.zapis.asSlice());
+                if (p.wartosc < 0.0) {
+                    d.blad.append(f"wiersz {numer}: niepoprawna wartosc '{p.zapis.asSlice()}'");
+                    return d;
+                }
+                d.pozycje.push(move p);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (d.pozycje.length() == 0 or d.pozycje.length() > MAKS_SLUPKOW) {
+        d.blad.append(f"plik ma {d.pozycje.length()} pozycji, wykres przyjmuje od 1 do {MAKS_SLUPKOW}");
+        return d;
+    }
+    d.ok = true;
+    return d;
+}
+
+fun maksimum(d: ref Dane) -> f64 = {
+    var m: f64 = 0.0;
+    var i: i64 = 0;
+    while (i < d.pozycje.length()) {
+        if (d.pozycje.at(i).wartosc > m) m = d.pozycje.at(i).wartosc;
+        i += 1;
+    }
+    if (m <= 0.0) m = 1.0;
+    return m;
+}
+
+# Kolor słupka i (paleta 0..255).
+fun kolorSlupka(k: ref cairo.Kontekst, i: i64) -> bool = {
+    let n = i % 4;
+    if (n == 0) return cairo.kolor255(k, 242, 201, 76, 255);
+    if (n == 1) return cairo.kolor255(k, 242, 153, 74, 255);
+    if (n == 2) return cairo.kolor255(k, 45, 156, 219, 255);
+    return cairo.kolor255(k, 39, 174, 96, 255);
+}
+
+fun xSlupka(d: ref Dane, i: i64) -> f64 = {
+    let slot = (SZEROKOSC - LEWY - PRAWY) / (d.pozycje.length() as f64);
+    return LEWY + (i as f64) * slot + slot * 0.2;
+}
+
+fun szerokoscSlupka(d: ref Dane) -> f64 = (SZEROKOSC - LEWY - PRAWY) / (d.pozycje.length() as f64) * 0.6;
+
+# Cała scena wykresu: tło, tytuł, siatka, osie, słupki i podpisy.
+fun rysujWykres(k: ref cairo.Kontekst, d: ref Dane, tytul: str) -> cairo.Status = {
+    let wys = WYSOKOSC - GORNY - DOLNY;
+    let maks = maksimum(d);
+    cairo.wyczysc(k, 1.0, 1.0, 1.0, 1.0);
+    cairo.kolor255(k, 40, 40, 40, 255);
+    cairo.tekst(k, LEWY, 34.0, 20.0, tytul);
+    # Siatka co 25% maksimum.
+    cairo.gruboscLinii(k, 1.0);
+    var s: i64 = 1;
+    while (s <= 4) {
+        let y = WYSOKOSC - DOLNY - wys * (s as f64) / 4.0;
+        cairo.kolor255(k, 220, 220, 220, 255);
+        cairo.linia(k, LEWY, y + 0.5, SZEROKOSC - PRAWY, y + 0.5);
+        cairo.obrysuj(k);
+        cairo.kolor255(k, 110, 110, 110, 255);
+        let wartosc = (maks * (s as f64) / 4.0 + 0.5) as i64;
+        cairo.tekst(k, 12.0, y + 4.0, 11.0, f"{wartosc}".asSlice());
+        s += 1;
+    }
+    # Słupki z wartościami i etykietami.
+    var i: i64 = 0;
+    while (i < d.pozycje.length()) {
+        let h = wys * d.pozycje.at(i).wartosc / maks;
+        let x = xSlupka(d, i);
+        kolorSlupka(k, i);
+        cairo.prostokat(k, x, WYSOKOSC - DOLNY - h, szerokoscSlupka(d), h);
+        cairo.wypelnij(k);
+        cairo.kolor255(k, 40, 40, 40, 255);
+        cairo.tekst(k, x, WYSOKOSC - DOLNY - h - 6.0, 11.0, d.pozycje.at(i).zapis.asSlice());
+        cairo.tekst(k, x, WYSOKOSC - DOLNY + 18.0, 12.0, d.pozycje.at(i).etykieta.asSlice());
+        i += 1;
+    }
+    # Osie.
+    cairo.kolor255(k, 40, 40, 40, 255);
+    cairo.gruboscLinii(k, 2.0);
+    cairo.przesun(k, LEWY, GORNY - 10.0);
+    cairo.liniaDo(k, LEWY, WYSOKOSC - DOLNY);
+    cairo.liniaDo(k, SZEROKOSC - PRAWY, WYSOKOSC - DOLNY);
+    return cairo.obrysuj(k);
+}
+
+fun zaczynaSie(tekst: str, fragment: str) -> bool = {
+    if (tekst.length() < fragment.length()) return false;
+    var i: i64 = 0;
+    while (i < fragment.length()) {
+        if (tekst[i] != fragment[i]) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun konczySie(tekst: str, fragment: str) -> bool = {
+    var koniec = tekst.length();
+    while (koniec > 0 and (tekst[koniec - 1] == '\n' or tekst[koniec - 1] == ' ' or tekst[koniec - 1] == '\r')) {
+        koniec -= 1;
+    }
+    if (koniec < fragment.length()) return false;
+    var i: i64 = 0;
+    while (i < fragment.length()) {
+        if (tekst[koniec - fragment.length() + i] != fragment[i]) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun main() -> i64 = {
+    let wersja = cairo.wersjaBiblioteki();
+    print(f"Generator wykresow (wrapper Cairo {wersja.asSlice()}). Podaj: plik CSV (etykieta;wartosc), nazwe plikow wynikowych bez rozszerzenia, tytul.\n");
+    let csv = czytajWiersz();
+    let nazwa = czytajWiersz();
+    let tytulWiersz = czytajWiersz();
+    if (not csv.jest or not nazwa.jest or csv.tekst.length() == 0 or nazwa.tekst.length() == 0) {
+        print("Blad: podaj plik CSV i nazwe plikow wynikowych w osobnych wierszach.\n");
+        return 2;
+    }
+    var tytul: String;
+    if (tytulWiersz.jest and tytulWiersz.tekst.length() > 0) {
+        tytul.append(tytulWiersz.tekst.asSlice());
+    } else {
+        tytul.append(csv.tekst.asSlice());
+    }
+    let odczyt = pliki.wczytaj(csv.tekst.asSlice());
+    if (not odczyt.ok) {
+        print(f"Blad: {odczyt.blad.asSlice()}\n");
+        return 3;
+    }
+    var dane = wczytajDane(csv.tekst.asSlice());
+    if (not dane.ok) {
+        print(f"Blad danych: {dane.blad.asSlice()}\n");
+        return 2;
+    }
+    var plikPng: String;
+    plikPng.append(nazwa.tekst.asSlice());
+    plikPng.append(".png");
+    var plikSvg: String;
+    plikSvg.append(nazwa.tekst.asSlice());
+    plikSvg.append(".svg");
+    var plikPdf: String;
+    plikPdf.append(nazwa.tekst.asSlice());
+    plikPdf.append(".pdf");
+
+    # PNG (piksele).
+    var powObraz = cairo.obraz(SZEROKOSC as i64, WYSOKOSC as i64);
+    var ko = cairo.kontekst(&powObraz);
+    let rysunekPng = rysujWykres(&ko, &dane, tytul.asSlice());
+    let zapisPng = cairo.zapiszPng(&powObraz, plikPng.asSlice());
+    cairo.zamknijKontekst(&ko);
+    cairo.zamknijPowierzchnie(&powObraz);
+    # SVG i PDF (wektorowo, ta sama scena).
+    var powSvg = cairo.svg(plikSvg.asSlice(), SZEROKOSC, WYSOKOSC);
+    var ks = cairo.kontekst(&powSvg);
+    let rysunekSvg = rysujWykres(&ks, &dane, tytul.asSlice());
+    cairo.zamknijKontekst(&ks);
+    let koniecSvg = cairo.zamknijPowierzchnie(&powSvg);
+    var powPdf = cairo.pdf(plikPdf.asSlice(), SZEROKOSC, WYSOKOSC);
+    var kp = cairo.kontekst(&powPdf);
+    let rysunekPdf = rysujWykres(&kp, &dane, tytul.asSlice());
+    cairo.zamknijKontekst(&kp);
+    let koniecPdf = cairo.zamknijPowierzchnie(&powPdf);
+    if (not rysunekPng.ok or not zapisPng.ok or not rysunekSvg.ok or not koniecSvg.ok or not rysunekPdf.ok or not koniecPdf.ok) {
+        var opisPng = copy zapisPng.opis;
+        if (zapisPng.ok) opisPng = copy rysunekPng.opis;
+        var opisSvg = copy koniecSvg.opis;
+        if (not powSvg.status.ok) opisSvg = copy powSvg.status.opis;
+        var opisPdf = copy koniecPdf.opis;
+        if (not powPdf.status.ok) opisPdf = copy powPdf.status.opis;
+        print(f"Blad zapisu:\n  PNG: {opisPng.asSlice()}\n  SVG: {opisSvg.asSlice()}\n  PDF: {opisPdf.asSlice()}\n");
+        return 5;
+    }
+    print(f"Wykres '{tytul.asSlice()}': {dane.pozycje.length()} slupkow, skala do {(maksimum(&dane) + 0.5) as i64}\n");
+
+    # Sprawdzenie wyników.
+    var wczytany = cairo.wczytajPng(plikPng.asSlice());
+    let px = cairo.pobierzPiksele(&wczytany);
+    let x = (xSlupka(&dane, 0) + szerokoscSlupka(&dane) / 2.0) as i64;
+    let k = cairo.kolorPiksela(&px, x, (WYSOKOSC - DOLNY - 3.0) as i64);
+    cairo.zamknijPowierzchnie(&wczytany);
+    let svgTekst = pliki.wczytaj(plikSvg.asSlice());
+    let pdfTekst = pliki.wczytaj(plikPdf.asSlice());
+    let pngOk = px.ok and px.szerokosc == 640 and px.wysokosc == 400 and k.r == 242 and k.g == 201 and k.b == 76;
+    let svgOk = svgTekst.ok and zaczynaSie(svgTekst.tresc.asSlice(), "<?xml") and konczySie(svgTekst.tresc.asSlice(), "</svg>");
+    let pdfOk = pdfTekst.ok and zaczynaSie(pdfTekst.tresc.asSlice(), "%PDF-") and konczySie(pdfTekst.tresc.asSlice(), "%%EOF");
+    print(f"  {plikPng.asSlice()}: {px.szerokosc}x{px.wysokosc} pikseli, pierwszy slupek ({k.r},{k.g},{k.b}) - {pngOk}\n");
+    print(f"  {plikSvg.asSlice()}: {svgTekst.tresc.length()} B, kompletny SVG - {svgOk}\n");
+    print(f"  {plikPdf.asSlice()}: {pdfTekst.tresc.length()} B, kompletny PDF - {pdfOk}\n");
+    if (not pngOk or not svgOk or not pdfOk) {
+        print("Blad: sprawdzenie zapisanych plikow nie powiodlo sie.\n");
+        return 5;
+    }
+    return 0;
+}

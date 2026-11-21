@@ -1,0 +1,74 @@
+#{
+    Przykład podstawowy: powierzchnia obrazu i kontekst, kolory, prostokąty, okrąg, linie,
+    zapis PNG, ta sama scena w SVG i PDF, odczyt pikseli i kontrolowane błędy.
+    Pliki przyklad.png, przyklad.svg i przyklad.pdf powstają w bieżącym katalogu.
+    Kod zakończenia: liczba niezgodności (0 = wszystko jak oczekiwano).
+#}
+import core.containers.*;
+import cairo;
+
+# Kaczka z prostych kształtów na tle 200 x 120 (jednostki: piksele albo punkty).
+fun kaczka(k: ref cairo.Kontekst) -> bool = {
+    var ok = cairo.wyczysc(k, 0.85, 0.93, 1.0, 1.0).ok;                       # niebo
+    ok = ok and cairo.kolor255(k, 70, 130, 180, 255) and cairo.prostokat(k, 0.0, 90.0, 200.0, 30.0) and cairo.wypelnij(k).ok;  # woda
+    ok = ok and cairo.kolor255(k, 242, 201, 76, 255) and cairo.prostokat(k, 50.0, 60.0, 80.0, 35.0) and cairo.wypelnij(k).ok;  # tułów
+    ok = ok and cairo.okrag(k, 130.0, 50.0, 20.0) and cairo.wypelnij(k).ok;                                                    # głowa
+    ok = ok and cairo.kolor255(k, 242, 153, 74, 255) and cairo.przesun(k, 148.0, 46.0) and cairo.liniaDo(k, 172.0, 52.0) and cairo.liniaDo(k, 148.0, 58.0) and cairo.zamknijSciezke(k) and cairo.wypelnij(k).ok;  # dziób
+    ok = ok and cairo.kolor(k, 0.1, 0.1, 0.1, 1.0) and cairo.okrag(k, 136.0, 44.0, 3.0) and cairo.wypelnij(k).ok;              # oko
+    ok = ok and cairo.kolor(k, 1.0, 1.0, 1.0, 0.6) and cairo.gruboscLinii(k, 3.0) and cairo.linia(k, 20.0, 105.0, 60.0, 105.0) and cairo.obrysuj(k).ok;  # fala
+    return ok;
+}
+
+fun main() -> i64 = {
+    var bledy: i64 = 0;
+    let wersja = cairo.wersjaBiblioteki();
+    print(f"Cairo {wersja.asSlice()}\n");
+
+    # 1. Obraz w pamięci i zapis PNG.
+    var p = cairo.obraz(200, 120);
+    var k = cairo.kontekst(&p);
+    let narysowana = kaczka(&k);
+    let png = cairo.zapiszPng(&p, "przyklad.png");
+    print(f"Obraz 200x120: rysowanie {narysowana}, zapis przyklad.png: {png.opis.asSlice()}\n");
+    let px = cairo.pobierzPiksele(&p);
+    let tulow = cairo.kolorPiksela(&px, 90, 75);
+    let woda = cairo.kolorPiksela(&px, 10, 110);
+    print(f"Piksele: krok {px.krok} bajtow na wiersz (ARGB32, kolor przemnozony przez alpha); tulow (90,75) = ({tulow.r},{tulow.g},{tulow.b},{tulow.a}); woda (10,110) = ({woda.r},{woda.g},{woda.b},{woda.a})\n");
+    if (not narysowana or not png.ok or tulow.r != 242 or tulow.g != 201 or woda.b != 180) bledy += 1;
+    cairo.zamknijKontekst(&k);
+    cairo.zamknijPowierzchnie(&p);
+
+    # 2. Ta sama scena w SVG i PDF - plik jest kompletny dopiero po zamknięciu powierzchni.
+    var s = cairo.svg("przyklad.svg", 200.0, 120.0);
+    var ks = cairo.kontekst(&s);
+    let svgOk = kaczka(&ks);
+    cairo.zamknijKontekst(&ks);
+    let koniecSvg = cairo.zamknijPowierzchnie(&s);
+    var d = cairo.pdf("przyklad.pdf", 200.0, 120.0);
+    var kd = cairo.kontekst(&d);
+    let pdfOk = kaczka(&kd);
+    cairo.zamknijKontekst(&kd);
+    let koniecPdf = cairo.zamknijPowierzchnie(&d);
+    print(f"przyklad.svg: {koniecSvg.opis.asSlice()}; przyklad.pdf: {koniecPdf.opis.asSlice()}\n");
+    if (not svgOk or not pdfOk or not koniecSvg.ok or not koniecPdf.ok) bledy += 1;
+
+    # 3. Odczyt zapisanego PNG.
+    var wczytany = cairo.wczytajPng("przyklad.png");
+    let pw = cairo.pobierzPiksele(&wczytany);
+    let dziob = cairo.kolorPiksela(&pw, 152, 52);
+    print(f"Wczytany przyklad.png: {pw.szerokosc}x{pw.wysokosc}, dziob (152,52) = ({dziob.r},{dziob.g},{dziob.b},{dziob.a})\n");
+    if (pw.szerokosc != 200 or dziob.r != 242 or dziob.g != 153) bledy += 1;
+    cairo.zamknijPowierzchnie(&wczytany);
+
+    # 4. Kontrolowane błędy.
+    let zly = cairo.obraz(0, 50);
+    print(f"Obraz 0x50: {zly.status.opis.asSlice()}\n");
+    let brak = cairo.svg("brak_katalogu/x.svg", 10.0, 10.0);
+    print(f"SVG w nieistniejacym katalogu: kod {brak.status.kod}: {brak.status.opis.asSlice()}\n");
+    let zamkniety = cairo.wypelnij(&k);
+    print(f"Wypelnienie zamknietym kontekstem: {zamkniety.opis.asSlice()}\n");
+    if (zly.status.kod != cairo.BLEDNE_WYMIARY or brak.status.ok or zamkniety.kod != cairo.ZAMKNIETY) bledy += 1;
+
+    print(f"Niezgodnosci: {bledy}\n");
+    return bledy;
+}

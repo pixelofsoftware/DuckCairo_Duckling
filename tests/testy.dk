@@ -1,0 +1,219 @@
+# Testy wrappera Cairo: build.py podstawia ten plik w miejsce app/app.dk.
+# Pliki zapisywane przez testy (test-*.png, .svg, .pdf) powstają w bieżącym katalogu
+# (domyślnie katalog budowy). Każde sprawdzenie wypisuje PASS albo FAIL; kod = liczba błędów.
+import core.containers.*;
+import cairo;
+import pliki;
+
+fun sprawdz(warunek: bool, nazwa: str) -> i64 = {
+    if (warunek) {
+        print(f"PASS {nazwa}\n");
+        return 0;
+    }
+    print(f"FAIL {nazwa}\n");
+    return 1;
+}
+
+fun blisko(a: i64, b: i64, tolerancja: i64) -> bool = a - b <= tolerancja and b - a <= tolerancja;
+
+fun kolorJak(p: ref cairo.Piksele, x: i64, y: i64, r: i64, g: i64, b: i64, a: i64, tolerancja: i64) -> bool = {
+    let k = cairo.kolorPiksela(p, x, y);
+    return blisko(k.r, r, tolerancja) and blisko(k.g, g, tolerancja) and blisko(k.b, b, tolerancja) and blisko(k.a, a, tolerancja);
+}
+
+fun zawiera(tekst: str, fragment: str) -> bool = {
+    var i: i64 = 0;
+    while (i + fragment.length() <= tekst.length()) {
+        var j: i64 = 0;
+        var zgodne = true;
+        while (zgodne and j < fragment.length()) {
+            if (tekst[i + j] != fragment[j]) zgodne = false;
+            j += 1;
+        }
+        if (zgodne) return true;
+        i += 1;
+    }
+    return false;
+}
+
+fun zaczynaSie(tekst: str, fragment: str) -> bool = {
+    if (tekst.length() < fragment.length()) return false;
+    var i: i64 = 0;
+    while (i < fragment.length()) {
+        if (tekst[i] != fragment[i]) return false;
+        i += 1;
+    }
+    return true;
+}
+
+# Scena testowa 10x10: białe tło, czerwony kwadrat 4x4 od (2,2), czarna linia pozioma
+# grubości 2 na wysokości y = 8 (piksele 7 i 8), półprzezroczysty niebieski piksel (0,0).
+fun scena(k: ref cairo.Kontekst) -> bool = {
+    var ok = cairo.wyczysc(k, 1.0, 1.0, 1.0, 1.0).ok;
+    ok = ok and cairo.kolor(k, 1.0, 0.0, 0.0, 1.0) and cairo.prostokat(k, 2.0, 2.0, 4.0, 4.0) and cairo.wypelnij(k).ok;
+    ok = ok and cairo.kolor(k, 0.0, 0.0, 0.0, 1.0) and cairo.gruboscLinii(k, 2.0) and cairo.linia(k, 0.0, 8.0, 10.0, 8.0) and cairo.obrysuj(k).ok;
+    return ok;
+}
+
+fun testyPikseli() -> i64 = {
+    var b: i64 = 0;
+    let wersja = cairo.wersjaBiblioteki();
+    print(f"  (biblioteka: Cairo {wersja.asSlice()})\n");
+    b += sprawdz(zaczynaSie(wersja.asSlice(), "1."), "wersja biblioteki 1.x");
+    var p = cairo.obraz(10, 10);
+    b += sprawdz(p.status.ok and cairo.otwarta(&p) and p.szerokosc == 10.0, "powierzchnia obrazu 10x10");
+    var k = cairo.kontekst(&p);
+    b += sprawdz(k.status.ok and scena(&k) and cairo.stan(&k).ok, "kontekst i scena: kolor, prostokat, wypelnienie, linia, grubosc");
+    var px = cairo.pobierzPiksele(&p);
+    print(f"  krok wiersza: {px.krok} bajtow, piksel (3,3) surowo: {cairo.surowy(&px, 3, 3)}\n");
+    b += sprawdz(px.ok and px.szerokosc == 10 and px.wysokosc == 10 and px.krok >= 40 and px.dane.length() == px.krok * 10, "kopia pikseli: wymiary, krok, rozmiar");
+    b += sprawdz(cairo.surowy(&px, 3, 3) == 4294901760 and kolorJak(&px, 3, 3, 255, 0, 0, 255, 0), "czerwony kwadrat: 0xFFFF0000");
+    b += sprawdz(kolorJak(&px, 1, 1, 255, 255, 255, 255, 0) and kolorJak(&px, 6, 3, 255, 255, 255, 255, 0) and kolorJak(&px, 5, 5, 255, 0, 0, 255, 0), "krawedzie kwadratu wyrownane do pikseli: (1,1) i (6,3) biale, (5,5) czerwony");
+    b += sprawdz(kolorJak(&px, 4, 7, 0, 0, 0, 255, 0) and kolorJak(&px, 4, 8, 0, 0, 0, 255, 0) and kolorJak(&px, 4, 9, 255, 255, 255, 255, 0) and kolorJak(&px, 4, 6, 255, 255, 255, 255, 0), "linia grubosci 2 na y=8 zajmuje wiersze 7 i 8");
+    let o = 3 * px.krok + 3 * 4;
+    let b0: u8 = px.dane.at(o);
+    let b2: u8 = px.dane.at(o + 2);
+    let b3: u8 = px.dane.at(o + 3);
+    if (cairo.maloEndianowy()) {
+        b += sprawdz(b0 == 0u8 and b2 == 255u8 and b3 == 255u8, "kolejnosc bajtow w pamieci (little-endian): B, G, R, A");
+    } else {
+        b += sprawdz(b0 == 255u8, "kolejnosc bajtow w pamieci (big-endian): A, R, G, B");
+    }
+    cairo.zamknijKontekst(&k);
+    cairo.zamknijPowierzchnie(&p);
+
+    # Przezroczystość: kolor przemnożony przez alpha.
+    var przezr = cairo.obraz(4, 4);
+    var kp = cairo.kontekst(&przezr);
+    cairo.kolor(&kp, 0.0, 0.0, 1.0, 0.5);
+    cairo.prostokat(&kp, 0.0, 0.0, 2.0, 2.0);
+    cairo.wypelnij(&kp);
+    let pp = cairo.pobierzPiksele(&przezr);
+    let v = cairo.surowy(&pp, 0, 0);
+    print(f"  polprzezroczysty niebieski surowo: alpha {(v >> 24) & 255}, niebieski {v & 255}\n");
+    b += sprawdz(blisko((v >> 24) & 255, 128, 1) and blisko(v & 255, 128, 1) and ((v >> 16) & 255) == 0, "alpha 0.5: zapisany niebieski przemnozony (128, nie 255)");
+    b += sprawdz(kolorJak(&pp, 0, 0, 0, 0, 255, 128, 1) and kolorJak(&pp, 3, 3, 0, 0, 0, 0, 0), "kolorPiksela odwraca przemnozenie; puste tlo = (0,0,0,0)");
+    cairo.zamknijKontekst(&kp);
+    cairo.zamknijPowierzchnie(&przezr);
+    return b;
+}
+
+fun testyPlikow() -> i64 = {
+    var b: i64 = 0;
+    var p = cairo.obraz(10, 10);
+    var k = cairo.kontekst(&p);
+    scena(&k);
+    let zapis = cairo.zapiszPng(&p, "test-scena.png");
+    b += sprawdz(zapis.ok, "zapis PNG");
+    var wczytany = cairo.wczytajPng("test-scena.png");
+    let pw = cairo.pobierzPiksele(&wczytany);
+    b += sprawdz(not pw.przezroczystosc, "nieprzezroczysty PNG wczytany jako RGB24 (alpha = 255)");
+    b += sprawdz(wczytany.status.ok and pw.szerokosc == 10 and pw.wysokosc == 10 and kolorJak(&pw, 3, 3, 255, 0, 0, 255, 0) and kolorJak(&pw, 4, 8, 0, 0, 0, 255, 0) and kolorJak(&pw, 8, 2, 255, 255, 255, 255, 0), "odczyt zapisanego PNG: wymiary i znane piksele");
+    let plikPng = pliki.wczytaj("test-scena.png");
+    let t = plikPng.tresc.asSlice();
+    b += sprawdz(plikPng.ok and t.length() > 8 and t[1] == 'P' and t[2] == 'N' and t[3] == 'G', "plik PNG zaczyna sie od sygnatury PNG");
+    cairo.zamknijPowierzchnie(&wczytany);
+    cairo.zamknijKontekst(&k);
+    cairo.zamknijPowierzchnie(&p);
+
+    # Ta sama scena na powierzchniach SVG i PDF.
+    var s = cairo.svg("test-scena.svg", 10.0, 10.0);
+    var ks = cairo.kontekst(&s);
+    let rysSvg = scena(&ks);
+    cairo.zamknijKontekst(&ks);
+    let koniecSvg = cairo.zamknijPowierzchnie(&s);
+    let plikSvg = pliki.wczytaj("test-scena.svg");
+    b += sprawdz(rysSvg and koniecSvg.ok and plikSvg.ok and zawiera(plikSvg.tresc.asSlice(), "<svg") and zawiera(plikSvg.tresc.asSlice(), "</svg>") and zawiera(plikSvg.tresc.asSlice(), "0 0 10 10"), "SVG: ta sama scena, plik kompletny po zamknieciu (<svg viewBox 0 0 10 10> ... </svg>)");
+    b += sprawdz(zawiera(plikSvg.tresc.asSlice(), "rgb(100%, 0%, 0%)") or zawiera(plikSvg.tresc.asSlice(), "rgb(100%,0%,0%)"), "SVG: zawiera czerwone wypelnienie");
+    var d = cairo.pdf("test-scena.pdf", 10.0, 10.0);
+    var kd = cairo.kontekst(&d);
+    let rysPdf = scena(&kd);
+    cairo.zamknijKontekst(&kd);
+    let koniecPdf = cairo.zamknijPowierzchnie(&d);
+    let plikPdf = pliki.wczytaj("test-scena.pdf");
+    b += sprawdz(rysPdf and koniecPdf.ok and plikPdf.ok and zaczynaSie(plikPdf.tresc.asSlice(), "%PDF-") and zawiera(plikPdf.tresc.asSlice(), "%%EOF"), "PDF: ta sama scena, plik kompletny po zamknieciu (%PDF- ... %%EOF)");
+    return b;
+}
+
+fun testyBledow() -> i64 = {
+    var b: i64 = 0;
+    let zero = cairo.obraz(0, 10);
+    let ujemny = cairo.obraz(-5, 5);
+    let wielki = cairo.obraz(40000, 10);
+    let pamiec = cairo.obraz(32000, 32000);
+    print(f"  obraz 40000x10: {wielki.status.opis.asSlice()}\n");
+    b += sprawdz(zero.status.kod == cairo.BLEDNE_WYMIARY and ujemny.status.kod == cairo.BLEDNE_WYMIARY and wielki.status.kod == cairo.BLEDNE_WYMIARY and pamiec.status.kod == cairo.BLEDNE_WYMIARY and not cairo.otwarta(&wielki), "wymiary 0, ujemne, ponad 32767 i ponad limit pamieci odrzucone przed wywolaniem Cairo");
+    var nieskonczonosc: f64 = 1.0;
+    var i: i64 = 0;
+    while (i < 400) {
+        nieskonczonosc = nieskonczonosc * 10.0;
+        i += 1;
+    }
+    let svgZero = cairo.svg("test-zle.svg", 0.0, 10.0);
+    let pdfNieskonczony = cairo.pdf("test-zle.pdf", nieskonczonosc, 10.0);
+    let pdfWielki = cairo.pdf("test-zle.pdf", 20000.0, 10.0);
+    b += sprawdz(svgZero.status.kod == cairo.BLEDNE_WYMIARY and pdfNieskonczony.status.kod == cairo.BLEDNE_WYMIARY and pdfWielki.status.kod == cairo.BLEDNE_WYMIARY, "SVG/PDF: wymiar 0, nieskonczony i ponad 14400 pt odrzucone");
+    let brakKatalogu = cairo.svg("brak_katalogu/x.svg", 10.0, 10.0);
+    print(f"  SVG w nieistniejacym katalogu: kod {brakKatalogu.status.kod}: {brakKatalogu.status.opis.asSlice()}\n");
+    b += sprawdz(not brakKatalogu.status.ok and brakKatalogu.status.kod > 0 and brakKatalogu.status.opis.length() > 10 and not cairo.otwarta(&brakKatalogu), "SVG w nieistniejacym katalogu: status bledu Cairo z opisem");
+    let brakPng = cairo.wczytajPng("nie_ma.png");
+    print(f"  brakujacy PNG: kod {brakPng.status.kod}: {brakPng.status.opis.asSlice()}\n");
+    b += sprawdz(brakPng.status.kod == cairo.CAIRO_FILE_NOT_FOUND, "wczytanie brakujacego PNG: FILE_NOT_FOUND");
+
+    var p = cairo.obraz(4, 4);
+    let zapisZly = cairo.zapiszPng(&p, "brak_katalogu/x.png");
+    print(f"  zapis PNG do nieistniejacego katalogu: kod {zapisZly.kod}: {zapisZly.opis.asSlice()}\n");
+    b += sprawdz(not zapisZly.ok and zapisZly.kod == cairo.CAIRO_WRITE_ERROR, "zapis PNG do nieistniejacego katalogu: WRITE_ERROR");
+    var k = cairo.kontekst(&p);
+    b += sprawdz(not cairo.kolor(&k, 1.5, 0.0, 0.0, 1.0) and not cairo.kolor(&k, 0.0, 0.0, 0.0, -0.1) and not cairo.gruboscLinii(&k, 0.0) and not cairo.okrag(&k, 1.0, 1.0, -2.0) and cairo.wyczysc(&k, 2.0, 0.0, 0.0, 1.0).kod == cairo.BLEDNE_PARAMETRY, "kolor poza 0..1, grubosc 0, ujemny promien odrzucone");
+    cairo.zamknijKontekst(&k);
+    b += sprawdz(not cairo.kolor(&k, 0.0, 0.0, 0.0, 1.0) and cairo.wypelnij(&k).kod == cairo.ZAMKNIETY and cairo.stan(&k).kod == cairo.ZAMKNIETY and not cairo.zamknijKontekst(&k), "zamkniety kontekst: operacje odrzucone, podwojne zamkniecie false");
+    let pierwsze = cairo.zamknijPowierzchnie(&p);
+    let drugie = cairo.zamknijPowierzchnie(&p);
+    b += sprawdz(pierwsze.ok and drugie.kod == cairo.ZAMKNIETY and cairo.zapiszPng(&p, "test-x.png").kod == cairo.ZAMKNIETY and cairo.kontekst(&p).status.kod == cairo.ZAMKNIETY and cairo.pobierzPiksele(&p).status.kod == cairo.ZAMKNIETY, "zamknieta powierzchnia: zapis, kontekst i piksele odrzucone");
+
+    # Kontekst przeżywa zamknięcie powierzchni (trzyma własną referencję); rysowanie po
+    # zakończeniu pliku SVG daje status SURFACE_FINISHED.
+    var s = cairo.svg("test-po-zamknieciu.svg", 10.0, 10.0);
+    var ks = cairo.kontekst(&s);
+    cairo.zamknijPowierzchnie(&s);
+    cairo.prostokat(&ks, 0.0, 0.0, 5.0, 5.0);
+    let poZamknieciu = cairo.wypelnij(&ks);
+    print(f"  rysowanie po zamknieciu SVG: kod {poZamknieciu.kod}: {poZamknieciu.opis.asSlice()}\n");
+    b += sprawdz(poZamknieciu.kod == cairo.CAIRO_SURFACE_FINISHED and cairo.stan(&ks).kod == cairo.CAIRO_SURFACE_FINISHED, "rysowanie po zakonczeniu powierzchni: SURFACE_FINISHED (trwaly status kontekstu)");
+    cairo.zamknijKontekst(&ks);
+    var svgPiksele = cairo.svg("test-piksele.svg", 5.0, 5.0);
+    b += sprawdz(cairo.pobierzPiksele(&svgPiksele).status.kod == cairo.ZLY_RODZAJ and cairo.zapiszPng(&svgPiksele, "test-x.png").kod == cairo.ZLY_RODZAJ, "piksele i PNG tylko dla powierzchni obrazu");
+    cairo.zamknijPowierzchnie(&svgPiksele);
+    return b;
+}
+
+fun testPetli() -> i64 = {
+    var udane: i64 = 0;
+    var i: i64 = 0;
+    while (i < 300) {
+        var p = cairo.obraz(64, 48);
+        var k = cairo.kontekst(&p);
+        if (scena(&k) and cairo.okrag(&k, 32.0, 24.0, 10.0) and cairo.wypelnij(&k).ok) udane += 1;
+        if (cairo.zapiszPng(&p, "test-petla.png").ok) udane += 1;
+        cairo.zamknijKontekst(&k);
+        cairo.zamknijPowierzchnie(&p);
+        var s = cairo.pdf("test-petla.pdf", 64.0, 48.0);
+        var ks = cairo.kontekst(&s);
+        scena(&ks);
+        cairo.zamknijKontekst(&ks);
+        if (cairo.zamknijPowierzchnie(&s).ok) udane += 1;
+        i += 1;
+    }
+    return sprawdz(udane == 900, "300 cykli: obraz, PNG, PDF - tworzenie, rysowanie i zwalnianie");
+}
+
+fun main() -> i64 = {
+    var bledy: i64 = 0;
+    bledy += testyPikseli();
+    bledy += testyPlikow();
+    bledy += testyBledow();
+    bledy += testPetli();
+    print(f"Bledy: {bledy}\n");
+    return bledy;
+}

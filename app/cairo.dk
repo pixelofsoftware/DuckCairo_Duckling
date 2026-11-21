@@ -1,0 +1,531 @@
+#{
+    cairo: wrapper biblioteki Cairo dla Ducklinga - rysowanie poza ekranem na powierzchni
+    obrazu (piksele, zapis PNG) oraz na powierzchniach SVG i PDF.
+
+    Typy publiczne:
+    * Powierzchnia - płótno: obraz w pamięci (OBRAZ, jednostka = piksel) albo plik SVG/PDF
+      (jednostka = punkt, 1/72 cala);
+    * Kontekst - stan rysowania (kolor, grubość linii, bieżąca ścieżka) związany z jedną
+      powierzchnią;
+    * Status - wynik operacji: ok, kod statusu Cairo (cairo_status_t) i jego opis.
+
+    Własność (zasady Cairo): każda funkcja *_create zwraca obiekt z jedną referencją, którą
+    trzeba oddać przez *_destroy. Wrapper trzyma po jednej referencji w każdym obiekcie:
+    zamknij(&kontekst) wywołuje cairo_destroy, zamknij(&powierzchnia) - cairo_surface_finish
+    (zakończenie zapisu pliku SVG/PDF) i cairo_surface_destroy. Kontekst sam trzyma referencję
+    do swojej powierzchni, więc kolejność zamykania jest dowolna; rysowanie po zakończeniu
+    powierzchni kończy się statusem SURFACE_FINISHED. Użycie zamkniętego obiektu jest
+    odrzucane przez wrapper (Status z kodem ZAMKNIETY) bez wywoływania biblioteki.
+
+    Piksele (pobierzPiksele): kopia danych powierzchni obrazu w formacie CAIRO_FORMAT_ARGB32:
+    * wiersze od góry, każdy wiersz zajmuje `krok` bajtów (stride, wielokrotność 4, może być
+      większy niż szerokosc * 4);
+    * piksel to 32-bitowa liczba 0xAARRGGBB w natywnej kolejności bajtów procesora - na
+      x86_64 i arm64 (little-endian) w pamięci leżą kolejno bajty B, G, R, A;
+    * kolor jest PRZEMNOŻONY przez przezroczystość (premultiplied): R, G, B <= A.
+    Obraz wczytany z nieprzezroczystego PNG ma format CAIRO_FORMAT_RGB24 (ten sam układ,
+    górny bajt nieużywany); pole przezroczystosc = false, a odczyt daje alpha 255.
+    Funkcja kolorPiksela(&piksele, x, y) zwraca składowe po odwróceniu przemnożenia (0..255).
+#}
+import core.containers.*;
+import core.builtins as builtins;
+import core.clib as clib;
+
+extern("C") {
+    fundecl strlen(s: cptr char) -> u64;
+    fundecl cairo_version_string() -> cptr char;
+    fundecl cairo_status_to_string(status: i32) -> cptr char;
+    fundecl cairo_format_stride_for_width(format: i32, szerokosc: i32) -> i32;
+    fundecl cairo_image_surface_create(format: i32, szerokosc: i32, wysokosc: i32) -> u64;
+    fundecl cairo_image_surface_create_from_png(sciezka: cptr char) -> u64;
+    fundecl cairo_image_surface_get_data(powierzchnia: u64) -> cptr u8;
+    fundecl cairo_image_surface_get_stride(powierzchnia: u64) -> i32;
+    fundecl cairo_image_surface_get_width(powierzchnia: u64) -> i32;
+    fundecl cairo_image_surface_get_height(powierzchnia: u64) -> i32;
+    fundecl cairo_image_surface_get_format(powierzchnia: u64) -> i32;
+    fundecl cairo_svg_surface_create(sciezka: cptr char, szerokosc: f64, wysokosc: f64) -> u64;
+    fundecl cairo_pdf_surface_create(sciezka: cptr char, szerokosc: f64, wysokosc: f64) -> u64;
+    fundecl cairo_surface_status(powierzchnia: u64) -> i32;
+    fundecl cairo_surface_flush(powierzchnia: u64) -> ();
+    fundecl cairo_surface_finish(powierzchnia: u64) -> ();
+    fundecl cairo_surface_destroy(powierzchnia: u64) -> ();
+    fundecl cairo_surface_write_to_png(powierzchnia: u64, sciezka: cptr char) -> i32;
+    fundecl cairo_create(powierzchnia: u64) -> u64;
+    fundecl cairo_destroy(kontekst: u64) -> ();
+    fundecl cairo_status(kontekst: u64) -> i32;
+    fundecl cairo_save(kontekst: u64) -> ();
+    fundecl cairo_restore(kontekst: u64) -> ();
+    fundecl cairo_set_source_rgba(kontekst: u64, r: f64, g: f64, b: f64, a: f64) -> ();
+    fundecl cairo_set_line_width(kontekst: u64, grubosc: f64) -> ();
+    fundecl cairo_new_path(kontekst: u64) -> ();
+    fundecl cairo_move_to(kontekst: u64, x: f64, y: f64) -> ();
+    fundecl cairo_line_to(kontekst: u64, x: f64, y: f64) -> ();
+    fundecl cairo_rectangle(kontekst: u64, x: f64, y: f64, szerokosc: f64, wysokosc: f64) -> ();
+    fundecl cairo_arc(kontekst: u64, xc: f64, yc: f64, promien: f64, kat1: f64, kat2: f64) -> ();
+    fundecl cairo_close_path(kontekst: u64) -> ();
+    fundecl cairo_fill(kontekst: u64) -> ();
+    fundecl cairo_fill_preserve(kontekst: u64) -> ();
+    fundecl cairo_stroke(kontekst: u64) -> ();
+    fundecl cairo_paint(kontekst: u64) -> ();
+    fundecl cairo_select_font_face(kontekst: u64, rodzina: cptr char, pochylenie: i32, waga: i32) -> ();
+    fundecl cairo_set_font_size(kontekst: u64, rozmiar: f64) -> ();
+    fundecl cairo_show_text(kontekst: u64, tekst: cptr char) -> ();
+}
+
+# Rodzaje powierzchni.
+const OBRAZ: i64 = 1;
+const SVG: i64 = 2;
+const PDF: i64 = 3;
+
+# Kody statusu: 0..N to cairo_status_t z Cairo, ujemne - wykryte przez wrapper przed wywołaniem.
+const SUKCES: i64 = 0;                     # CAIRO_STATUS_SUCCESS
+const CAIRO_NO_MEMORY: i64 = 1;
+const CAIRO_INVALID_RESTORE: i64 = 2;
+const CAIRO_NO_CURRENT_POINT: i64 = 4;
+const CAIRO_FILE_NOT_FOUND: i64 = 18;
+const CAIRO_READ_ERROR: i64 = 10;
+const CAIRO_WRITE_ERROR: i64 = 11;
+const CAIRO_SURFACE_FINISHED: i64 = 12;
+const CAIRO_INVALID_SIZE: i64 = 32;
+const ZAMKNIETY: i64 = -1;                 # obiekt został już zamknięty albo nie powstał
+const BLEDNE_WYMIARY: i64 = -2;            # wymiary poza zakresem albo ponad limit pamięci
+const BLEDNE_PARAMETRY: i64 = -3;          # kolor poza 0..1, grubość <= 0, NaN, zła nazwa pliku
+const ZLY_RODZAJ: i64 = -4;                # operacja wymaga powierzchni obrazu
+
+const FORMAT_ARGB32: i32 = 0i32;
+const FORMAT_RGB24: i32 = 1i32;            # jak ARGB32, ale bez przezroczystości (górny bajt nieużywany)
+const MAKS_PIKSELI_BOKU: i64 = 32767;      # ograniczenie Cairo dla powierzchni obrazu
+const MAKS_PUNKTOW_BOKU: f64 = 14400.0;    # 200 cali - największa strona PDF; ten sam limit dla SVG
+const LIMIT_PAMIECI: i64 = 268435456;      # 256 MiB pikseli powierzchni obrazu
+
+class Status {
+    ok: bool = true;
+    kod: i64 = SUKCES;
+    opis: String;
+}
+
+class Powierzchnia {
+    uchwyt: u64 = 0u64;        # wewnętrzne: cairo_surface_t*
+    rodzaj: i64 = 0;
+    szerokosc: f64 = 0.0;      # piksele (OBRAZ) albo punkty (SVG, PDF)
+    wysokosc: f64 = 0.0;
+    sciezka: String;           # plik SVG/PDF (pusty dla obrazu)
+    status: Status;            # status utworzenia
+}
+
+class Kontekst {
+    uchwyt: u64 = 0u64;        # wewnętrzne: cairo_t*
+    status: Status;
+}
+
+class Kolor {
+    r: i64 = 0;
+    g: i64 = 0;
+    b: i64 = 0;
+    a: i64 = 0;
+}
+
+class Piksele {
+    ok: bool = false;
+    szerokosc: i64 = 0;
+    wysokosc: i64 = 0;
+    krok: i64 = 0;             # bajty na wiersz (stride)
+    przezroczystosc: bool = true;  # false dla formatu RGB24 (np. nieprzezroczysty PNG): alpha = 255
+    dane: List[u8];            # kopia: wysokosc * krok bajtów ARGB32 (albo RGB24), przemnożone przez alpha
+    status: Status;
+}
+
+fun zC(napis: cptr char) -> String = {
+    var wynik: String;
+    if (napis as u64 == 0u64) return wynik;
+    wynik.append(builtins.slice_from_ptr_len[char](napis as manyptr char, strlen(napis) as i64));
+    return wynik;
+}
+
+fun naC(s: str) -> String = {
+    var w: String;
+    w.append(s);
+    w.append('\0');
+    return w;
+}
+
+fun wersjaBiblioteki() -> String = zC(cairo_version_string());
+
+# Opis statusu: dla kodów Cairo tekst z cairo_status_to_string, dla kodów wrappera - własny.
+fun opisStatusu(kod: i64) -> String = {
+    var w: String;
+    if (kod == ZAMKNIETY) {
+        w.append("obiekt zostal juz zamkniety albo nie zostal utworzony");
+    } else if (kod == BLEDNE_WYMIARY) {
+        w.append("niepoprawne wymiary powierzchni");
+    } else if (kod == BLEDNE_PARAMETRY) {
+        w.append("niepoprawne parametry operacji");
+    } else if (kod == ZLY_RODZAJ) {
+        w.append("operacja wymaga powierzchni obrazu");
+    } else {
+        w = zC(cairo_status_to_string(kod as i32));
+    }
+    return w;
+}
+
+fun status(kod: i64) -> Status = {
+    var s: Status;
+    s.ok = kod == SUKCES;
+    s.kod = kod;
+    s.opis = opisStatusu(kod);
+    return s;
+}
+
+fun statusZOpisem(kod: i64, opis: str) -> Status = {
+    var s = status(kod);
+    s.opis.append(": ");
+    s.opis.append(opis);
+    return s;
+}
+
+# Liczba skończona: dla NaN i nieskończoności x - x nie daje 0.
+fun skonczona(x: f64) -> bool = x - x == 0.0;
+
+fun zawieraZero(s: str) -> bool = {
+    var i: i64 = 0;
+    while (i < s.length()) {
+        if (s[i] as i64 == 0) return true;
+        i += 1;
+    }
+    return false;
+}
+
+fun bladPowierzchni(rodzaj: i64, kod: i64, opis: str) -> Powierzchnia = {
+    var p: Powierzchnia;
+    p.rodzaj = rodzaj;
+    p.status = statusZOpisem(kod, opis);
+    return p;
+}
+
+#{
+    Liczba bajtów pikseli obrazu szerokosc x wysokosc (ARGB32, z wyrównaniem wiersza) albo -1,
+    gdy wymiary są spoza 1..32767 albo bufor przekroczyłby limit 256 MiB. Sprawdzane przed
+    wywołaniem Cairo; mnożenie nie przekracza zakresu (32767 * 4 * 32767 < 2^33).
+#}
+fun rozmiarObrazu(szerokosc: i64, wysokosc: i64) -> i64 = {
+    if (szerokosc < 1 or wysokosc < 1 or szerokosc > MAKS_PIKSELI_BOKU or wysokosc > MAKS_PIKSELI_BOKU) return -1;
+    let krok = cairo_format_stride_for_width(FORMAT_ARGB32, szerokosc as i32) as i64;
+    if (krok < szerokosc * 4) return -1;
+    let bajty = krok * wysokosc;
+    if (bajty > LIMIT_PAMIECI) return -1;
+    return bajty;
+}
+
+# Powierzchnia obrazu ARGB32 (piksele), wypełniona przezroczystą czernią.
+fun obraz(szerokosc: i64, wysokosc: i64) -> Powierzchnia = {
+    if (rozmiarObrazu(szerokosc, wysokosc) < 0) {
+        return bladPowierzchni(OBRAZ, BLEDNE_WYMIARY, f"obraz {szerokosc}x{wysokosc}: kazdy bok 1..{MAKS_PIKSELI_BOKU} pikseli, razem najwyzej {LIMIT_PAMIECI} bajtow".asSlice());
+    }
+    let uchwyt = cairo_image_surface_create(FORMAT_ARGB32, szerokosc as i32, wysokosc as i32);
+    var p: Powierzchnia;
+    p.rodzaj = OBRAZ;
+    p.szerokosc = szerokosc as f64;
+    p.wysokosc = wysokosc as f64;
+    let kod = cairo_surface_status(uchwyt) as i64;
+    if (kod != SUKCES) {
+        cairo_surface_destroy(uchwyt);    # obiekt błędu Cairo też oddajemy
+        p.status = status(kod);
+        return p;
+    }
+    p.uchwyt = uchwyt;
+    return p;
+}
+
+fun wektorowa(rodzaj: i64, sciezka: str, szerokosc: f64, wysokosc: f64) -> Powierzchnia = {
+    if (not skonczona(szerokosc) or not skonczona(wysokosc) or szerokosc <= 0.0 or wysokosc <= 0.0 or szerokosc > MAKS_PUNKTOW_BOKU or wysokosc > MAKS_PUNKTOW_BOKU) {
+        return bladPowierzchni(rodzaj, BLEDNE_WYMIARY, f"strona {szerokosc}x{wysokosc} pt: kazdy bok wiekszy od 0 i najwyzej {MAKS_PUNKTOW_BOKU} pt".asSlice());
+    }
+    if (sciezka.length() == 0 or zawieraZero(sciezka)) return bladPowierzchni(rodzaj, BLEDNE_PARAMETRY, "nazwa pliku jest pusta albo zawiera bajt 0");
+    let nazwa = naC(sciezka);
+    var uchwyt: u64 = 0u64;
+    if (rodzaj == SVG) {
+        uchwyt = cairo_svg_surface_create(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, szerokosc, wysokosc);
+    } else {
+        uchwyt = cairo_pdf_surface_create(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, szerokosc, wysokosc);
+    }
+    var p: Powierzchnia;
+    p.rodzaj = rodzaj;
+    p.szerokosc = szerokosc;
+    p.wysokosc = wysokosc;
+    p.sciezka.append(sciezka);
+    let kod = cairo_surface_status(uchwyt) as i64;
+    if (kod != SUKCES) {
+        cairo_surface_destroy(uchwyt);
+        p.status = statusZOpisem(kod, sciezka);
+        return p;
+    }
+    p.uchwyt = uchwyt;
+    return p;
+}
+
+# Powierzchnia SVG zapisywana do pliku; wymiary w punktach. Plik jest kompletny po zamknij().
+fun svg(sciezka: str, szerokosc: f64, wysokosc: f64) -> Powierzchnia = wektorowa(SVG, sciezka, szerokosc, wysokosc);
+
+# Powierzchnia PDF (jedna strona) zapisywana do pliku; plik jest kompletny po zamknij().
+fun pdf(sciezka: str, szerokosc: f64, wysokosc: f64) -> Powierzchnia = wektorowa(PDF, sciezka, szerokosc, wysokosc);
+
+# Powierzchnia obrazu wczytana z pliku PNG (do sprawdzania zapisanych wyników).
+fun wczytajPng(sciezka: str) -> Powierzchnia = {
+    if (sciezka.length() == 0 or zawieraZero(sciezka)) return bladPowierzchni(OBRAZ, BLEDNE_PARAMETRY, "nazwa pliku jest pusta albo zawiera bajt 0");
+    let nazwa = naC(sciezka);
+    let uchwyt = cairo_image_surface_create_from_png(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char);
+    var p: Powierzchnia;
+    p.rodzaj = OBRAZ;
+    let kod = cairo_surface_status(uchwyt) as i64;
+    if (kod != SUKCES) {
+        cairo_surface_destroy(uchwyt);
+        p.status = statusZOpisem(kod, sciezka);
+        return p;
+    }
+    p.uchwyt = uchwyt;
+    p.szerokosc = cairo_image_surface_get_width(uchwyt) as f64;
+    p.wysokosc = cairo_image_surface_get_height(uchwyt) as f64;
+    return p;
+}
+
+fun otwarta(p: ref Powierzchnia) -> bool = p.uchwyt != 0u64;
+
+# Zakończenie (zapis pliku SVG/PDF) i zwolnienie powierzchni. Zwraca status zakończenia;
+# ZAMKNIETY, gdy powierzchnia była już zamknięta.
+fun zamknijPowierzchnie(p: ref Powierzchnia) -> Status = {
+    if (p.uchwyt == 0u64) return status(ZAMKNIETY);
+    cairo_surface_finish(p.uchwyt);
+    let kod = cairo_surface_status(p.uchwyt) as i64;
+    cairo_surface_destroy(p.uchwyt);
+    p.uchwyt = 0u64;
+    if (kod != SUKCES and p.sciezka.length() > 0) return statusZOpisem(kod, p.sciezka.asSlice());
+    return status(kod);
+}
+
+# Zapis powierzchni obrazu do pliku PNG (8 bitów, z kanałem alpha).
+fun zapiszPng(p: ref Powierzchnia, sciezka: str) -> Status = {
+    if (p.uchwyt == 0u64) return status(ZAMKNIETY);
+    if (p.rodzaj != OBRAZ) return status(ZLY_RODZAJ);
+    if (sciezka.length() == 0 or zawieraZero(sciezka)) return statusZOpisem(BLEDNE_PARAMETRY, "nazwa pliku jest pusta albo zawiera bajt 0");
+    let nazwa = naC(sciezka);
+    let kod = cairo_surface_write_to_png(p.uchwyt, builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char) as i64;
+    if (kod != SUKCES) return statusZOpisem(kod, sciezka);
+    return status(SUKCES);
+}
+
+# Kontekst rysowania dla powierzchni. Kontekst trzyma własną referencję do powierzchni.
+fun kontekst(p: ref Powierzchnia) -> Kontekst = {
+    var k: Kontekst;
+    if (p.uchwyt == 0u64) {
+        k.status = status(ZAMKNIETY);
+        return k;
+    }
+    let uchwyt = cairo_create(p.uchwyt);
+    let kod = cairo_status(uchwyt) as i64;
+    if (kod != SUKCES) {
+        cairo_destroy(uchwyt);
+        k.status = status(kod);
+        return k;
+    }
+    k.uchwyt = uchwyt;
+    return k;
+}
+
+fun otwarty(k: ref Kontekst) -> bool = k.uchwyt != 0u64;
+
+# Status kontekstu: ZAMKNIETY albo bieżący status Cairo (błąd w Cairo jest trwały).
+fun stan(k: ref Kontekst) -> Status = {
+    if (k.uchwyt == 0u64) return status(ZAMKNIETY);
+    return status(cairo_status(k.uchwyt) as i64);
+}
+
+fun zamknijKontekst(k: ref Kontekst) -> bool = {
+    if (k.uchwyt == 0u64) return false;
+    cairo_destroy(k.uchwyt);
+    k.uchwyt = 0u64;
+    return true;
+}
+
+fun skladowa(x: f64) -> bool = skonczona(x) and x >= 0.0 and x <= 1.0;
+
+# Kolor źródła: składowe 0..1 (r, g, b w sRGB, a - nieprzezroczystość).
+fun kolor(k: ref Kontekst, r: f64, g: f64, b: f64, a: f64) -> bool = {
+    if (k.uchwyt == 0u64 or not skladowa(r) or not skladowa(g) or not skladowa(b) or not skladowa(a)) return false;
+    cairo_set_source_rgba(k.uchwyt, r, g, b, a);
+    return true;
+}
+
+# Kolor z wartości 0..255.
+fun kolor255(k: ref Kontekst, r: i64, g: i64, b: i64, a: i64) -> bool = kolor(k, (r as f64) / 255.0, (g as f64) / 255.0, (b as f64) / 255.0, (a as f64) / 255.0);
+
+fun gruboscLinii(k: ref Kontekst, grubosc: f64) -> bool = {
+    if (k.uchwyt == 0u64 or not skonczona(grubosc) or grubosc <= 0.0) return false;
+    cairo_set_line_width(k.uchwyt, grubosc);
+    return true;
+}
+
+fun prostokat(k: ref Kontekst, x: f64, y: f64, szerokosc: f64, wysokosc: f64) -> bool = {
+    if (k.uchwyt == 0u64 or not skonczona(x) or not skonczona(y) or not skonczona(szerokosc) or not skonczona(wysokosc)) return false;
+    cairo_rectangle(k.uchwyt, x, y, szerokosc, wysokosc);
+    return true;
+}
+
+fun przesun(k: ref Kontekst, x: f64, y: f64) -> bool = {
+    if (k.uchwyt == 0u64 or not skonczona(x) or not skonczona(y)) return false;
+    cairo_move_to(k.uchwyt, x, y);
+    return true;
+}
+
+fun liniaDo(k: ref Kontekst, x: f64, y: f64) -> bool = {
+    if (k.uchwyt == 0u64 or not skonczona(x) or not skonczona(y)) return false;
+    cairo_line_to(k.uchwyt, x, y);
+    return true;
+}
+
+# Odcinek (nowy fragment ścieżki); narysuj go przez obrysuj().
+fun linia(k: ref Kontekst, x1: f64, y1: f64, x2: f64, y2: f64) -> bool = przesun(k, x1, y1) and liniaDo(k, x2, y2);
+
+# Okrąg (pełny łuk) jako nowy fragment ścieżki.
+fun okrag(k: ref Kontekst, x: f64, y: f64, promien: f64) -> bool = {
+    if (k.uchwyt == 0u64 or not skonczona(x) or not skonczona(y) or not skonczona(promien) or promien <= 0.0) return false;
+    cairo_new_path(k.uchwyt);
+    cairo_arc(k.uchwyt, x, y, promien, 0.0, 6.283185307179586);
+    cairo_close_path(k.uchwyt);
+    return true;
+}
+
+fun zamknijSciezke(k: ref Kontekst) -> bool = {
+    if (k.uchwyt == 0u64) return false;
+    cairo_close_path(k.uchwyt);
+    return true;
+}
+
+# Wypełnienie bieżącej ścieżki kolorem źródła; ścieżka jest potem czyszczona.
+fun wypelnij(k: ref Kontekst) -> Status = {
+    if (k.uchwyt == 0u64) return status(ZAMKNIETY);
+    cairo_fill(k.uchwyt);
+    return status(cairo_status(k.uchwyt) as i64);
+}
+
+# Wypełnienie z zachowaniem ścieżki (np. żeby ją potem obrysować).
+fun wypelnijZachowaj(k: ref Kontekst) -> Status = {
+    if (k.uchwyt == 0u64) return status(ZAMKNIETY);
+    cairo_fill_preserve(k.uchwyt);
+    return status(cairo_status(k.uchwyt) as i64);
+}
+
+# Obrysowanie bieżącej ścieżki linią o bieżącej grubości; ścieżka jest potem czyszczona.
+fun obrysuj(k: ref Kontekst) -> Status = {
+    if (k.uchwyt == 0u64) return status(ZAMKNIETY);
+    cairo_stroke(k.uchwyt);
+    return status(cairo_status(k.uchwyt) as i64);
+}
+
+# Wypełnienie całej powierzchni kolorem (składowe 0..1).
+fun wyczysc(k: ref Kontekst, r: f64, g: f64, b: f64, a: f64) -> Status = {
+    if (k.uchwyt == 0u64) return status(ZAMKNIETY);
+    if (not skladowa(r) or not skladowa(g) or not skladowa(b) or not skladowa(a)) return status(BLEDNE_PARAMETRY);
+    cairo_save(k.uchwyt);
+    cairo_set_source_rgba(k.uchwyt, r, g, b, a);
+    cairo_paint(k.uchwyt);
+    cairo_restore(k.uchwyt);
+    return status(cairo_status(k.uchwyt) as i64);
+}
+
+#{
+    Napis UTF-8 od punktu (x, y) - y to linia bazowa. Używa prostego API tekstu Cairo
+    (rodzina "sans-serif"), więc kształt liter zależy od czcionek systemu; nadaje się do
+    podpisów wykresów, nie do dokładnego składu tekstu.
+#}
+fun tekst(k: ref Kontekst, x: f64, y: f64, rozmiar: f64, napis: str) -> Status = {
+    if (k.uchwyt == 0u64) return status(ZAMKNIETY);
+    if (not skonczona(x) or not skonczona(y) or not skonczona(rozmiar) or rozmiar <= 0.0 or zawieraZero(napis)) return status(BLEDNE_PARAMETRY);
+    let c = naC(napis);
+    cairo_select_font_face(k.uchwyt, builtins.ptr_from_slice[char]("sans-serif\0") as cptr char, 0i32, 0i32);
+    cairo_set_font_size(k.uchwyt, rozmiar);
+    cairo_move_to(k.uchwyt, x, y);
+    cairo_show_text(k.uchwyt, builtins.ptr_from_slice[char](c.asSlice()) as cptr char);
+    return status(cairo_status(k.uchwyt) as i64);
+}
+
+# Kopia pikseli powierzchni obrazu (po cairo_surface_flush). Układ: opis na początku modułu.
+fun pobierzPiksele(p: ref Powierzchnia) -> Piksele = {
+    var w: Piksele;
+    if (p.uchwyt == 0u64) {
+        w.status = status(ZAMKNIETY);
+        return w;
+    }
+    let format = cairo_image_surface_get_format(p.uchwyt);
+    if (p.rodzaj != OBRAZ or (format != FORMAT_ARGB32 and format != FORMAT_RGB24)) {
+        w.status = status(ZLY_RODZAJ);
+        return w;
+    }
+    w.przezroczystosc = format == FORMAT_ARGB32;
+    cairo_surface_flush(p.uchwyt);
+    let dane = cairo_image_surface_get_data(p.uchwyt);
+    w.szerokosc = cairo_image_surface_get_width(p.uchwyt) as i64;
+    w.wysokosc = cairo_image_surface_get_height(p.uchwyt) as i64;
+    w.krok = cairo_image_surface_get_stride(p.uchwyt) as i64;
+    if (dane as u64 == 0u64 or w.krok < w.szerokosc * 4) {
+        w.status = status(CAIRO_NO_MEMORY);
+        return w;
+    }
+    let ile = w.krok * w.wysokosc;
+    w.dane.reserve(ile);
+    let b = dane as manyptr u8;
+    var i: i64 = 0;
+    while (i < ile) {
+        w.dane.push(b[i]);
+        i += 1;
+    }
+    w.status = status(SUKCES);
+    w.ok = true;
+    return w;
+}
+
+# Czy procesor zapisuje liczby od najmniej znaczącego bajtu (x86_64, arm64: tak).
+fun maloEndianowy() -> bool = {
+    let bufor = clib.malloc(4u64);
+    if (bufor as u64 == 0u64) return true;
+    let jako32 = bufor as manyptr u32;
+    jako32[0] = 1u32;
+    let jako8 = bufor as manyptr u8;
+    let pierwszy: u8 = jako8[0];
+    clib.free(bufor);
+    return pierwszy == 1u8;
+}
+
+# Surowa wartość piksela 0xAARRGGBB (kolor przemnożony przez alpha; dla RGB24 alpha = 0xFF);
+# -1 poza obrazem.
+fun surowy(p: ref Piksele, x: i64, y: i64) -> i64 = {
+    if (not p.ok or x < 0 or y < 0 or x >= p.szerokosc or y >= p.wysokosc) return -1;
+    let o = y * p.krok + x * 4;
+    let b0: u8 = p.dane.at(o);
+    let b1: u8 = p.dane.at(o + 1);
+    let b2: u8 = p.dane.at(o + 2);
+    let b3: u8 = p.dane.at(o + 3);
+    var v: i64 = 0;
+    if (maloEndianowy()) {
+        v = ((b3 as i64) << 24) | ((b2 as i64) << 16) | ((b1 as i64) << 8) | (b0 as i64);
+    } else {
+        v = ((b0 as i64) << 24) | ((b1 as i64) << 16) | ((b2 as i64) << 8) | (b3 as i64);
+    }
+    if (not p.przezroczystosc) v = v | 4278190080;    # RGB24: górny bajt nieużywany, alpha = 255
+    return v;
+}
+
+# Kolor piksela po odwróceniu przemnożenia przez alpha (składowe 0..255); poza obrazem: (0,0,0,0).
+fun kolorPiksela(p: ref Piksele, x: i64, y: i64) -> Kolor = {
+    var k: Kolor;
+    let v = surowy(p, x, y);
+    if (v < 0) return k;
+    k.a = (v >> 24) & 255;
+    let r = (v >> 16) & 255;
+    let g = (v >> 8) & 255;
+    let b = v & 255;
+    if (k.a == 0) return k;
+    k.r = (r * 255 + k.a / 2) / k.a;
+    k.g = (g * 255 + k.a / 2) / k.a;
+    k.b = (b * 255 + k.a / 2) / k.a;
+    return k;
+}
